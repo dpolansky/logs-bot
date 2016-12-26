@@ -83,9 +83,9 @@ func loadChannelsFromFile() (map[string]string, error) {
 }
 
 func (b *botConfig) Serve() {
-	shutdownChannels := []chan struct{}{}
-
 	for {
+		shutdownChannels := []chan struct{}{}
+
 		if err := b.connect(); err != nil {
 			log.Printf("Failed to connect to Twitch IRC server, retrying")
 			time.Sleep(twitchIRCRetryTimeInSeconds * time.Second)
