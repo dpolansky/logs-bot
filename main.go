@@ -17,10 +17,11 @@ import (
 )
 
 const (
-	staleLogThresholdInSeconds  = 30
-	spoilerSleepTimeInSeconds   = 15
-	logRefreshTimeInSeconds     = 30
-	twitchIRCRetryTimeInSeconds = 30
+	staleLogThresholdInSeconds    = 30
+	elapsedTimeThresholdInSeconds = 60
+	spoilerSleepTimeInSeconds     = 15
+	logRefreshTimeInSeconds       = 10
+	twitchIRCRetryTimeInSeconds   = 30
 
 	twitchIRCHostPort = "irc.chat.twitch.tv:6667"
 
@@ -40,8 +41,8 @@ type botConfig struct {
 	conn                   net.Conn
 	steamIDToTwitchChannel map[string]string
 
-	mutex              *sync.Mutex
-	steamIDToLastLogID map[string]string
+	mutex             *sync.Mutex
+	steamIDToLastTime map[string]time.Time
 
 	userName string
 	oauthKey string
@@ -66,6 +67,8 @@ func main() {
 		userName:               userName,
 		oauthKey:               oauthKey,
 		steamIDToTwitchChannel: steamIDToTwitchChannel,
+		mutex:             &sync.Mutex{},
+		steamIDToLastTime: map[string]time.Time{},
 	}
 
 	for {
@@ -144,8 +147,15 @@ func (b *botConfig) checkLogsForPlayer(steamid, channel string) error {
 	tm := time.Unix(res.Date, 0)
 	elapsed := time.Since(tm)
 
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	lastTime, _ := b.steamIDToLastTime[steamid]
+
 	// ignore logs that are stale
-	if elapsed.Seconds() > staleLogThresholdInSeconds {
+	// stale if:
+	// the log is older than the stale log threshold
+	// the time elapsed since the last log was sent is less than elapsed threshold
+	if elapsed.Seconds() > staleLogThresholdInSeconds || time.Now().Sub(lastTime).Seconds() < elapsedTimeThresholdInSeconds {
 		return nil
 	}
 
@@ -158,6 +168,7 @@ func (b *botConfig) checkLogsForPlayer(steamid, channel string) error {
 	}
 
 	log.Printf("Sent log id=%v channel=%v\n", id, channel)
+	b.steamIDToLastTime[steamid] = time.Now()
 	return nil
 }
 
