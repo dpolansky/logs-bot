@@ -6,20 +6,20 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"net/textproto"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	staleLogThresholdInMinutes  = 1
+	staleLogThresholdInSeconds  = 30
 	spoilerSleepTimeInSeconds   = 15
-	logRefreshTimeInSeconds     = 10
+	logRefreshTimeInSeconds     = 30
 	twitchIRCRetryTimeInSeconds = 30
 
 	twitchIRCHostPort = "irc.chat.twitch.tv:6667"
@@ -39,8 +39,12 @@ type logResponse struct {
 type botConfig struct {
 	conn                   net.Conn
 	steamIDToTwitchChannel map[string]string
-	userName               string
-	oauthKey               string
+
+	mutex              *sync.Mutex
+	steamIDToLastLogID map[string]string
+
+	userName string
+	oauthKey string
 }
 
 func main() {
@@ -64,51 +68,52 @@ func main() {
 		steamIDToTwitchChannel: steamIDToTwitchChannel,
 	}
 
-	b.Serve()
-}
-
-func loadChannelsFromFile() (map[string]string, error) {
-	var channels map[string]string
-	b, err := ioutil.ReadFile(channelsFileName)
-	if err != nil {
-		return nil, err
-	}
-
-	err = json.Unmarshal(b, &channels)
-	if err != nil {
-		return nil, err
-	}
-
-	return channels, nil
-}
-
-func (b *botConfig) Serve() {
 	for {
-		shutdownChannels := []chan struct{}{}
-
-		if err := b.connect(); err != nil {
-			log.Printf("Failed to connect to Twitch IRC server, retrying")
-			time.Sleep(twitchIRCRetryTimeInSeconds * time.Second)
-			continue
-		}
-
-		log.Printf("Connected to Twitch IRC server\n")
-
-		for steamid, channel := range b.steamIDToTwitchChannel {
-			c := make(chan struct{})
-			shutdownChannels = append(shutdownChannels, c)
-			go b.handleLogsForPlayer(steamid, channel, c)
-		}
-
-		if err := b.readMessages(); err != nil {
-			log.Printf("Error in reading message from Twitch: %v, reconnecting\n", err)
-		}
-
-		// shut down worker go-routines
-		for _, ch := range shutdownChannels {
-			ch <- struct{}{}
-		}
+		err := b.Serve()
+		log.Printf("Error serving: %v, retrying in %v seconds\n", err, twitchIRCRetryTimeInSeconds)
+		time.Sleep(twitchIRCRetryTimeInSeconds * time.Second)
 	}
+}
+
+func (b *botConfig) Serve() error {
+	log.Printf("Connecting to Twitch IRC server\n")
+	if err := b.connect(); err != nil {
+		return fmt.Errorf("Failed to connect to Twitch IRC server\n")
+	}
+
+	log.Printf("Connected!\n")
+
+	die := make(chan struct{})
+	go func(die chan struct{}) {
+		for {
+			select {
+			case <-die:
+				return
+			default:
+				for steamid, channel := range b.steamIDToTwitchChannel {
+					go b.checkLogsForPlayer(steamid, channel)
+				}
+				time.Sleep(logRefreshTimeInSeconds * time.Second)
+			}
+		}
+	}(die)
+
+	err := b.readMessages()
+	die <- struct{}{}
+	return err
+}
+
+func (b *botConfig) connect() error {
+	conn, err := net.Dial("tcp", twitchIRCHostPort)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(conn, "PASS %s\r\n", string(b.oauthKey))
+	fmt.Fprintf(conn, "NICK %s\r\n", b.userName)
+
+	b.conn = conn
+	return nil
 }
 
 func (b *botConfig) readMessages() error {
@@ -129,65 +134,34 @@ func (b *botConfig) readMessages() error {
 	}
 }
 
-func (b *botConfig) handleLogsForPlayer(steamid, channel string, shutdown chan struct{}) {
-	fmt.Fprintf(b.conn, "JOIN #%s\r\n", channel)
-	log.Printf("Connected to channel: %v\n", channel)
-
-	lastLog := ""
-	done := false
-
-	for !done {
-		select {
-		case <-shutdown:
-			done = true
-			continue
-		default:
-			break
-		}
-
-		time.Sleep(logRefreshTimeInSeconds * time.Second)
-
-		res, err := getLastLogForPlayer(steamid)
-		if err != nil {
-			log.Printf("Failed to get log for channel=%s: %v\n", channel, err)
-			continue
-		}
-
-		tm := time.Unix(res.Date, 0)
-		elapsed := time.Since(tm)
-		id := strconv.Itoa(res.ID)
-
-		// ignore logs that are stale
-		if id == lastLog || elapsed.Minutes() > staleLogThresholdInMinutes {
-			continue
-		}
-
-		// sleep to prevent spoilers
-		time.Sleep(spoilerSleepTimeInSeconds * time.Second)
-
-		fmt.Fprintf(b.conn, "PRIVMSG #"+channel+" :http://logs.tf/"+id+" (%v min ago)\r\n", math.Ceil(elapsed.Minutes()))
-		log.Printf("sent log id=%v channel=%v minutesElapsed=%v\n", id, channel, math.Ceil(elapsed.Minutes()))
-
-		lastLog = id
-	}
-
-	log.Printf("Shutting down worker for channel: %v\n", channel)
-}
-
-func (b *botConfig) connect() error {
-	conn, err := net.Dial("tcp", twitchIRCHostPort)
+func (b *botConfig) checkLogsForPlayer(steamid, channel string) error {
+	res, err := getNewestLogForPlayer(steamid)
 	if err != nil {
 		return err
 	}
 
-	fmt.Fprintf(conn, "PASS %s\r\n", string(b.oauthKey))
-	fmt.Fprintf(conn, "NICK %s\r\n", b.userName)
+	id := strconv.Itoa(res.ID)
+	tm := time.Unix(res.Date, 0)
+	elapsed := time.Since(tm)
 
-	b.conn = conn
+	// ignore logs that are stale
+	if elapsed.Seconds() > staleLogThresholdInSeconds {
+		return nil
+	}
+
+	// sleep to prevent spoilers
+	time.Sleep(spoilerSleepTimeInSeconds * time.Second)
+
+	_, err = fmt.Fprintf(b.conn, "PRIVMSG #"+channel+" :http://logs.tf/"+id+"\r\n")
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Sent log id=%v channel=%v\n", id, channel)
 	return nil
 }
 
-func getLastLogForPlayer(steamid string) (*logResponse, error) {
+func getNewestLogForPlayer(steamid string) (*logResponse, error) {
 	res, err := http.Get("http://logs.tf/json_search?player=" + steamid + "&limit=1")
 
 	if err != nil {
@@ -214,8 +188,23 @@ func getLastLogForPlayer(steamid string) (*logResponse, error) {
 	}
 
 	if q.Success == false || q.Results == 0 {
-		return nil, fmt.Errorf("query failed, results=%v\n", q.Results)
+		return nil, fmt.Errorf("Failed to get log for steamid=%v, response:\n%v\n", steamid, string(body))
 	}
 
 	return &(q.Logs[0]), nil
+}
+
+func loadChannelsFromFile() (map[string]string, error) {
+	var channels map[string]string
+	b, err := ioutil.ReadFile(channelsFileName)
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal(b, &channels)
+	if err != nil {
+		return nil, err
+	}
+
+	return channels, nil
 }
