@@ -17,11 +17,10 @@ import (
 )
 
 const (
-	staleLogThresholdInSeconds    = 30
-	elapsedTimeThresholdInSeconds = 60
-	spoilerSleepTimeInSeconds     = 15
-	logRefreshTimeInSeconds       = 10
-	twitchIRCRetryTimeInSeconds   = 30
+	staleLogThresholdInSeconds  = 60 // how old a log must be in seconds to be considered stale
+	spoilerDelayInSeconds       = 15 // how long to delay sending logs to prevent spoilers (stream delay)
+	logRefreshTimeInSeconds     = 10 // how long to wait between checking for log updates
+	twitchIRCRetryTimeInSeconds = 30 // how long to wait between failed connection attempts
 
 	twitchIRCHostPort = "irc.chat.twitch.tv:6667"
 
@@ -86,6 +85,8 @@ func (b *botConfig) Serve() error {
 
 	log.Printf("Connected!\n")
 
+	// spawn a worker processes that periodically checks for log updates and shuts down when
+	// the IRC server connection errors/drops
 	die := make(chan struct{})
 	go func(die chan struct{}) {
 		for {
@@ -101,6 +102,7 @@ func (b *botConfig) Serve() error {
 		}
 	}(die)
 
+	// read messages endlessly until an error occurs, then shut down worker process
 	err := b.readMessages()
 	die <- struct{}{}
 	return err
@@ -144,31 +146,38 @@ func (b *botConfig) checkLogsForPlayer(steamid, channel string) error {
 	}
 
 	id := strconv.Itoa(res.ID)
-	tm := time.Unix(res.Date, 0)
-	elapsed := time.Since(tm)
+	timestamp := time.Unix(res.Date, 0)
 
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 	lastTime, _ := b.steamIDToLastTime[steamid]
 
-	// ignore logs that are stale
-	// stale if:
-	// the log is older than the stale log threshold
-	// the time elapsed since the last log was sent is less than elapsed threshold
-	if elapsed.Seconds() > staleLogThresholdInSeconds || time.Now().Sub(lastTime).Seconds() < elapsedTimeThresholdInSeconds {
+	// if the log is stale or it hasn't been updated (its timestamp is the same as the last one we've seen),
+	// then do nothing
+	elapsed := time.Since(timestamp)
+	if elapsed.Seconds() > staleLogThresholdInSeconds || timestamp.Equal(lastTime) {
 		return nil
 	}
 
-	// sleep to prevent spoilers
-	time.Sleep(spoilerSleepTimeInSeconds * time.Second)
+	if err := b.sendLogToChannel(id, channel); err != nil {
+		return err
+	}
 
-	_, err = fmt.Fprintf(b.conn, "PRIVMSG #"+channel+" :http://logs.tf/"+id+"\r\n")
+	// save the last seen timestamp
+	b.steamIDToLastTime[steamid] = timestamp
+	return nil
+}
+
+func (b *botConfig) sendLogToChannel(logID, channel string) error {
+	// sleep to prevent spoilers due to stream delay
+	time.Sleep(spoilerDelayInSeconds * time.Second)
+
+	_, err := fmt.Fprintf(b.conn, "PRIVMSG #"+channel+" :http://logs.tf/"+logID+"\r\n")
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Sent log id=%v channel=%v\n", id, channel)
-	b.steamIDToLastTime[steamid] = time.Now()
+	log.Printf("Sent log id=%v channel=%v\n", logID, channel)
 	return nil
 }
 
