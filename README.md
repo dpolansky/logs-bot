@@ -1,6 +1,7 @@
 # logs-bot
 
 logs-bot is a simple Twitch bot that fetches TF2 match logs from logs.tf and posts them in a Twitch chat room.
+![Chat Screenshot](https://raw.githubusercontent.com/dpolansky/logs-bot/master/chat-screenshot.png)
 
 ## Installation
 
@@ -22,4 +23,14 @@ Create a file `channels.json` with a mapping from each steamID to Twitch channel
   "76561198107240606": "lansky",
   "76561197991735941": "clockwork"
 }
+```
+
+`go get` will create an executable in your `$GOPATH/bin` (make sure `$GOPATH/bin` is in your $PATH), or build the executable with:
+```
+go build
+```
+
+Then run the executable:
+```
+logs-bot
 ```
